@@ -1184,7 +1184,8 @@ class vLLMHttpServer:
             # Snapshot request IDs before pausing for reporting
             request_ids = list(self.engine.output_processor.request_states.keys())
 
-            # pause_generation in abort mode will:
+            # The legacy wait_for_inflight_requests=False and new
+            # pause_generation(mode="abort") APIs both:
             # 1. Set engine to paused state (new requests are accepted but not scheduled)
             # 2. Abort all in-flight requests
             # 3. Wait for requests to drain
