@@ -388,6 +388,7 @@ class vLLMColocateWorkerExtension:
         peft_config: dict,
         base_sync_done: bool,
     ):
+        """Apply a weight bucket as a LoRA adapter or base-model update, synchronizing supported drafter weights."""
         if peft_config and base_sync_done:
             # The caller already copied these out of the receiver's reused IPC bucket buffer (#6454).
             weights = dict(weights)
