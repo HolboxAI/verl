@@ -1311,6 +1311,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 model=unwrapped_model,
                 data_format=data_format,
                 forced_max_seqlen=forced_max_seqlen,
+                use_fused_kernels=use_fused_kernels,
             )
 
         if pad_mode == DatasetPadMode.NO_PADDING:
@@ -1412,6 +1413,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 local_cp_size=local_cp_size,
                 model=unwrapped_model,
                 data_format=data_format,
+                use_fused_kernels=use_fused_kernels,
             )
 
         # Router replay: switch to backward replay mode for next backward pass

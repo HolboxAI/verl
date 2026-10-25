@@ -120,6 +120,16 @@ def get_thd_quant_align_size(config) -> int | None:
     return None
 
 
+def get_thd_min_local_rows(config, local_cp_size: int | None = None, use_fused_kernels: bool = False) -> int | None:
+    """Return the CSA minimum used by the active model forward's THD packing path."""
+    if use_fused_kernels:
+        needs_csa_rows = getattr(config, "experimental_attention_variant", None) == "dsv4_hybrid"
+    else:
+        cp_size = local_cp_size if local_cp_size is not None else getattr(config, "context_parallel_size", 1)
+        needs_csa_rows = getattr(config, "dsv4_version", None) == "v4.1" and cp_size > 1
+    return config.csa_window_size if needs_csa_rows else None
+
+
 def _compute_quant_thd_align_size(align_size: int, quant_align_size: int) -> tuple[int, int]:
     """Compute low-precision alignment sizes for thd-format sequences.
 
@@ -637,6 +647,34 @@ def _build_npu_attn_mask(original_attention_mask: torch.Tensor) -> torch.Tensor:
     return (~attn_mask).unsqueeze(1).contiguous()
 
 
+def get_bshd_padded_seqlen(max_seqlen: int, batch_size: int, use_fp8_padding: bool = False) -> int:
+    """Align the raw BSHD sequence length for TP, zigzag CP, and low-precision GEMMs."""
+    cp_size = mpu.get_context_parallel_world_size()
+    tp_size = mpu.get_tensor_model_parallel_world_size()
+    # For CP (zigzag), sequence length must be divisible by (2 * cp_size).
+    # After zigzag-CP split each rank holds s/cp_size tokens, which must also be
+    # divisible by tp_size for sequence-parallel scatter.  Therefore the total
+    # sequence length must be divisible by tp_size * cp_size * 2.
+    align_size = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+    if align_size > 1:
+        pad_size = (align_size - max_seqlen % align_size) % align_size
+        max_seqlen += pad_size
+    if use_fp8_padding:
+        # For FP8 block quantization, batch_size * max_seqlen / tp_size must be divisible by 128.
+        # With CP, local sequence length is max_seqlen / cp_size.
+        # We need:
+        # 1) max_seqlen aligned for SP/CP splitting.
+        # 2) batch_size * max_seqlen % (128 * tp_size * cp_size) == 0.
+        # Compute the required alignment for max_seqlen:
+        fp8_total_align = 128 * tp_size * cp_size
+        fp8_seq_align = fp8_total_align // math.gcd(batch_size, fp8_total_align)
+        # Also ensure SP and CP split alignment.
+        fp8_seq_align = math.lcm(fp8_seq_align, align_size)
+        max_seqlen = ((max_seqlen + fp8_seq_align - 1) // fp8_seq_align) * fp8_seq_align
+
+    return max_seqlen
+
+
 def preprocess_bshd_engine(
     input_ids: torch.Tensor,
     pre_process: bool = True,
@@ -664,27 +702,7 @@ def preprocess_bshd_engine(
     dense_shape = tuple(input_ids.shape[2:])
     seqlens_in_batch = input_ids.offsets().diff()
     max_seqlen = forced_max_seqlen if forced_max_seqlen is not None else seqlens_in_batch.max().item()
-    tp_size = mpu.get_tensor_model_parallel_world_size()
-    # For CP (zigzag), sequence length must be divisible by (2 * cp_size).
-    # After zigzag-CP split each rank holds s/cp_size tokens, which must also be
-    # divisible by tp_size for sequence-parallel scatter.  Therefore the total
-    # sequence length must be divisible by tp_size * cp_size * 2.
-    align_size = tp_size * cp_size * 2 if cp_size > 1 else tp_size
-    if align_size > 1:
-        pad_size = (align_size - max_seqlen % align_size) % align_size
-        max_seqlen += pad_size
-    if use_fp8_padding:
-        # For FP8 block quantization, batch_size * max_seqlen / tp_size must be divisible by 128.
-        # With CP, local sequence length is max_seqlen / cp_size.
-        # We need:
-        # 1) max_seqlen aligned for SP/CP splitting.
-        # 2) batch_size * max_seqlen % (128 * tp_size * cp_size) == 0.
-        # Compute the required alignment for max_seqlen:
-        fp8_total_align = 128 * tp_size * cp_size
-        fp8_seq_align = fp8_total_align // math.gcd(batch_size, fp8_total_align)
-        # Also ensure SP and CP split alignment.
-        fp8_seq_align = math.lcm(fp8_seq_align, align_size)
-        max_seqlen = ((max_seqlen + fp8_seq_align - 1) // fp8_seq_align) * fp8_seq_align
+    max_seqlen = get_bshd_padded_seqlen(max_seqlen, batch_size, use_fp8_padding)
 
     local_max_seqlen = max_seqlen // cp_size if cp_size > 1 else max_seqlen
     attention_mask = torch.zeros(batch_size, local_max_seqlen, dtype=torch.bool, device=input_ids.device)

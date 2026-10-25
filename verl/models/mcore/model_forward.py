@@ -23,6 +23,7 @@ from verl.utils.megatron_utils import unwrap_model
 from .util import (
     build_deepseek_v41_image_inputs,
     build_vlm_attn_mask_bshd,
+    get_thd_min_local_rows,
     get_thd_quant_align_size,
     postprocess_bshd_engine,
     postprocess_thd_engine,
@@ -163,11 +164,7 @@ def gptmodel_forward_model_engine(
         thd_kwargs = dict(
             quant_align_size=quant_align_size,
             local_cp_size=local_cp_size,
-            min_local_rows=(
-                model_config.csa_window_size
-                if deepseek_v41_multimodal and (local_cp_size or getattr(model_config, "context_parallel_size", 1)) > 1
-                else None
-            ),
+            min_local_rows=get_thd_min_local_rows(model_config, local_cp_size),
             pad_to_length_bucket=pad_to_length_bucket,
             cp_layout=cp_layout,
         )
