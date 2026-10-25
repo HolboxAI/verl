@@ -335,6 +335,7 @@ class vLLMColocateWorkerExtension:
                     list(lora_weights.items()),
                     peft_config=peft_config,
                     base_sync_done=base_sync_done,
+                    weights_owned=True,
                 )
                 lora_weights.clear()
                 return
@@ -387,11 +388,14 @@ class vLLMColocateWorkerExtension:
         weights: list[tuple[str, torch.Tensor]],
         peft_config: dict,
         base_sync_done: bool,
+        weights_owned: bool = False,
     ):
         """Apply a weight bucket as a LoRA adapter or base-model update, synchronizing supported drafter weights."""
         if peft_config and base_sync_done:
-            # The caller already copied these out of the receiver's reused IPC bucket buffer (#6454).
-            weights = dict(weights)
+            # The IPC receiver reuses its bucket buffers, so callers that hand us borrowed tensors must
+            # clone them before vLLM retains the adapter. The receive callback stages owned tensors in a
+            # CPU block and opts out of this defensive copy to avoid undoing that allocation optimization.
+            weights = dict(weights) if weights_owned else {name: tensor.clone() for name, tensor in weights}
             lora_request = TensorLoRARequest(
                 lora_name=VLLM_LORA_NAME,
                 lora_int_id=VLLM_LORA_INT_ID,
