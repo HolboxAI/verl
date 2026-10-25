@@ -381,7 +381,9 @@ class MultiTurnSFTDataset(Dataset):
         for k, v in multi_modal_inputs.items():
             multi_modal_inputs[k] = torch.concat(v, dim=0)
 
-        if vision_token_types is not None:
+        if vision_token_types is not None and all(
+            key in multi_modal_inputs for key in ("pixel_values", "image_grid_hws")
+        ):
             multi_modal_inputs["vision_token_types"] = vision_token_types
 
         # 2. handle position_ids for Qwen-VL series models
@@ -405,6 +407,12 @@ class MultiTurnSFTDataset(Dataset):
 
         # 3. handle padding
         sequence_length = input_ids.shape[0]
+        if (
+            sequence_length > self.max_length
+            and "vision_token_types" in multi_modal_inputs
+            and self.truncation != "error"
+        ):
+            raise ValueError("Multimodal sequences require truncation='error'")
         # Handle sequence length
         if self.pad_mode == DatasetPadMode.RIGHT:
             if sequence_length < self.max_length:
