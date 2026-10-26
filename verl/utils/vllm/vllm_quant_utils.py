@@ -136,9 +136,7 @@ def is_quantized_model(vllm_config):
 
 def is_compressed_tensors_model(vllm_config) -> bool:
     """Compressed-tensors rollout, whose refit weights the trainer already quantized."""
-    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
-        CompressedTensorsConfig,
-    )
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsConfig
 
     return isinstance(getattr(vllm_config, "quant_config", None), CompressedTensorsConfig)
 
@@ -255,17 +253,112 @@ def load_quanted_weights(weights, model_runner, is_drafter=False, peft_config=No
     if peft_config is not None:
         from verl.utils.vllm.utils import resolve_weight_name
 
-        live_names = {n for n, _ in model.named_parameters(remove_duplicate=False)}
+        live_parameters = dict(model.named_parameters(remove_duplicate=False))
+        live_names = set(live_parameters)
         live_names.update(n for n, _ in model.named_buffers())
         routed_expert_prefixes = {
             prefix
             for prefix in ("mlp.experts.", "ffn.experts.")
             if any(f"{prefix}base_layer." in n for n in live_names)
         }
-        weights = [
-            (resolve_weight_name(model, n, live_names, routed_expert_prefixes=routed_expert_prefixes), t)
-            for n, t in weights
-        ]
+
+        packed_modules_mapping = getattr(model, "packed_modules_mapping", None) or {}
+        weight_mapper = getattr(model, "hf_to_vllm_mapper", None)
+
+        def live_weight_dtype(name):
+            candidates = [name]
+            if ".base_layer." in name:
+                candidates.append(name.replace(".base_layer.", ".", 1))
+            else:
+                prefix, leaf = name.rsplit(".", 1)
+                candidates.append(f"{prefix}.base_layer.{leaf}")
+
+            def match_dtype(candidate):
+                matches = [
+                    parameter
+                    for live_name, parameter in live_parameters.items()
+                    if live_name == candidate or live_name.endswith(f".{candidate}")
+                ]
+                dtypes = {parameter.dtype for parameter in matches}
+                return next(iter(dtypes)) if len(dtypes) == 1 else None
+
+            def mapped_candidates(candidate):
+                yield candidate
+                if weight_mapper is not None:
+                    mapped = weight_mapper.apply_list([candidate])
+                    if mapped and mapped[0] != candidate:
+                        yield mapped[0]
+
+            for candidate in candidates:
+                for mapped in mapped_candidates(candidate):
+                    dtype = match_dtype(mapped)
+                    if dtype is not None:
+                        return dtype
+
+            # LoRA exports use the checkpoint shard names (q_proj, k_proj, ...),
+            # while the live KDA/MLA module owns one packed parameter. Resolve a
+            # shard to its packed owner before deciding whether its scale is live.
+            for owner, shards in packed_modules_mapping.items():
+                for shard in shards:
+                    for candidate in candidates:
+                        for mapped_candidate in mapped_candidates(candidate):
+                            prefix, leaf = mapped_candidate.rsplit(".", 1)
+                            has_base_suffix = prefix.endswith(".base_layer")
+                            base_prefix = prefix.removesuffix(".base_layer")
+                            if not base_prefix.endswith(f".{shard}"):
+                                continue
+                            packed_prefix = base_prefix[: -len(shard)] + owner
+                            suffixes = [".base_layer"] if has_base_suffix else ["", ".base_layer"]
+                            for suffix in suffixes:
+                                dtype = match_dtype(f"{packed_prefix}{suffix}.{leaf}")
+                                if dtype is not None:
+                                    return dtype
+            return None
+
+        def dequant_fp8_block(weight, scale, block_size=128):
+            rows, cols = weight.shape
+            pad_rows, pad_cols = -rows % block_size, -cols % block_size
+            if pad_rows or pad_cols:
+                weight = torch.nn.functional.pad(weight, (0, pad_cols, 0, pad_rows))
+            scale = scale.float().repeat_interleave(block_size, 0).repeat_interleave(block_size, 1)
+            return (weight.float() * scale).to(torch.bfloat16)[:rows, :cols].contiguous()
+
+        fp8_dtypes = {torch.float8_e4m3fn, torch.float8_e5m2}
+        pending_fp8 = {}
+        normalized_weights = []
+        for name, tensor in weights:
+            resolved = resolve_weight_name(model, name, live_names, routed_expert_prefixes=routed_expert_prefixes)
+            leaf = resolved.rsplit(".", 1)[-1]
+            if leaf in {"weight", "weight_scale", "weight_scale_inv"}:
+                weight_name = resolved.rsplit(".", 1)[0] + ".weight"
+                live_dtype = live_weight_dtype(weight_name)
+                if live_dtype == torch.bfloat16 and (
+                    leaf == "weight" and tensor.dtype in fp8_dtypes or leaf in {"weight_scale", "weight_scale_inv"}
+                ):
+                    entry = pending_fp8.setdefault(weight_name, {})
+                    entry[leaf] = tensor
+                    if leaf == "weight":
+                        entry["weight_name"] = resolved
+                    if "weight" in entry and ("weight_scale" in entry or "weight_scale_inv" in entry):
+                        normalized_weights.append(
+                            (
+                                entry["weight_name"],
+                                dequant_fp8_block(
+                                    entry["weight"],
+                                    entry.get("weight_scale", entry.get("weight_scale_inv")),
+                                ),
+                            )
+                        )
+                        del pending_fp8[weight_name]
+                    continue
+                if (
+                    leaf in {"weight_scale", "weight_scale_inv"}
+                    and live_dtype is not None
+                    and live_dtype not in fp8_dtypes
+                ):
+                    continue
+            normalized_weights.append((resolved, tensor))
+        weights = normalized_weights
     weights = list(weights)
 
     # Monkey patch the param class to their subclass, as certain models

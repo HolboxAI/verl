@@ -150,6 +150,11 @@ def is_all_mxfp8_config(ct_config: Mapping[str, Any]) -> bool:
     return all(_preset_of(scheme) == "MXFP8" for scheme in _group_schemes(ct_config))
 
 
+def _module_name_for_quant_match(module: str) -> str:
+    """Match exported LoRA base weights against unwrapped HF FP8 exclusions."""
+    return module.removesuffix(".base_layer").removeprefix("model.")
+
+
 def _matches(name: str, targets: Iterable[str]) -> bool:
     for target in targets:
         if target.startswith("re:"):
@@ -461,13 +466,17 @@ class Fp8ConfigWeightQuantizer:
                 f"got activation_scheme={activation_scheme!r}, weight_block_size={block_size!r}, "
                 f"store_dtype={store_dtype!r}"
             )
-        self.ignore = list(fp8_config.get("ignored_layers") or fp8_config.get("modules_to_not_convert") or [])
+        self.ignore = [
+            _module_name_for_quant_match(module)
+            for module in (fp8_config.get("ignored_layers") or fp8_config.get("modules_to_not_convert") or [])
+        ]
         self.ignore_match_mode = fp8_config.get("ignored_layers_match_mode", "exact")
         if self.ignore_match_mode not in ("exact", "substring", "suffix"):
             raise ValueError(f"Unsupported ignored_layers_match_mode={self.ignore_match_mode!r}")
         self.scheme = _scheme_for_preset("FP8_BLOCK", ["Linear"])
 
     def _is_ignored(self, module: str) -> bool:
+        module = _module_name_for_quant_match(module)
         if _matches(module, DEFAULT_IGNORE):
             return True
         if self.ignore_match_mode == "exact":

@@ -798,7 +798,7 @@ def test_lora_adapter_path_skips_normalization():
     assert added == [{"language_model.model.layers.0.self_attn.q_proj.lora_A.weight"}]
 
 
-def test_lora_adapter_tensors_are_cloned_out_of_the_bucket():
+def test_lora_adapter_tensors_are_cloned_out_of_the_bucket(monkeypatch):
     """add_lora keeps the adapter tensors, so they must not alias the reused IPC bucket buffer (#6454)."""
     model = _FakeModel({"model.layers.0.self_attn.q_proj.base_layer.weight": torch.empty(0)})
     added = []
@@ -807,7 +807,11 @@ def test_lora_adapter_tensors_are_cloned_out_of_the_bucket():
 
     name = "model.layers.0.self_attn.q_proj.lora_A.weight"
     bucket = torch.arange(4.0)
-    worker._update_weights([(name, bucket)], peft_config={"r": 1}, base_sync_done=True)
+    _install_fake_receiver(monkeypatch, [([(name, bucket)], True)])
+    worker.remove_lora = lambda lora_id: None
+    worker.device = torch.device("cpu")
+    worker._get_zmq_handle = lambda: "ipc:///tmp/test-adapter-bucket-alias.sock"
+    worker.update_weights_from_ipc(peft_config={"r": 1}, base_sync_done=True)
     bucket.zero_()  # the receiver reuses the buffer for the next bucket
 
     (tensors,) = added
@@ -1285,6 +1289,263 @@ def test_strict_loader_re_suffixes_plain_name_on_newer_vllm(monkeypatch):
     worker = _make_worker(model)
     plain = "language_model.model.layers.0.self_attn.q_proj.weight"
     assert _resolve(worker, model, plain) == live  # re-suffixed
+
+
+def test_bf16_projection_scales_are_dropped_without_live_scale(monkeypatch):
+    """Trainer-only scales for live BF16 projections must be ignored."""
+    from verl.utils.vllm import vllm_quant_utils
+
+    class Mapper:
+        def apply_list(self, names):
+            # The live model has an outer wrapper prefix that this mapper does not
+            # expose; scale ownership must still resolve by a unique suffix.
+            return list(names)
+
+    class Model:
+        hf_to_vllm_mapper = Mapper()
+
+        def named_parameters(self, remove_duplicate=False):
+            return iter(
+                [
+                    (
+                        "language_model.model.layers.0.self_attn.in_proj_qkvbfg_a.base_layer.weight",
+                        torch.empty(0, dtype=torch.bfloat16),
+                    ),
+                    (
+                        "language_model.model.layers.3.self_attn.indexer.wq_b.base_layer.weight",
+                        torch.empty(0, dtype=torch.bfloat16),
+                    ),
+                    (
+                        "language_model.model.layers.0.self_attn.f_b_proj.base_layer.weight",
+                        torch.empty(0, dtype=torch.bfloat16),
+                    ),
+                ]
+            )
+
+        def named_buffers(self):
+            return iter(())
+
+        def load_weights(self, weights):
+            self.loaded = list(weights)
+            return {name for name, _ in self.loaded}
+
+    class Runner:
+        model = Model()
+
+    monkeypatch.setattr(vllm_quant_utils, "load_dsv41_engram_rows", lambda weights, model: (weights, set()))
+    vllm_quant_utils.load_quanted_weights(
+        [
+            ("layers.0.self_attn.in_proj_qkvbfg_a.weight", torch.empty(0)),
+            ("layers.0.self_attn.in_proj_qkvbfg_a.weight_scale_inv", torch.empty(0)),
+            ("layers.0.self_attn.f_b_proj.weight_scale_inv", torch.empty(0)),
+            ("layers.3.self_attn.indexer.wq_b.weight_scale_inv", torch.empty(0)),
+        ],
+        Runner(),
+        peft_config={"r": 1},
+    )
+    assert [name for name, _ in Runner.model.loaded] == ["layers.0.self_attn.in_proj_qkvbfg_a.weight"]
+
+
+@pytest.mark.parametrize("scale_first", [False, True])
+def test_fp8_pair_keeps_weight_name_when_dequantized(monkeypatch, scale_first):
+    """A paired FP8 weight must be loaded under its weight name, in either order."""
+    from verl.utils.vllm import vllm_quant_utils
+
+    class Model:
+        def named_parameters(self, remove_duplicate=False):
+            return iter([("layers.0.self_attn.q_b_proj.base_layer.weight", torch.empty(2, 2, dtype=torch.bfloat16))])
+
+        def named_buffers(self):
+            return iter(())
+
+        def load_weights(self, weights):
+            self.loaded = list(weights)
+            return {name for name, _ in self.loaded}
+
+    class Runner:
+        model = Model()
+
+    weight = torch.ones(2, 2, dtype=torch.float8_e4m3fn)
+    scale = torch.ones(1, 1, dtype=torch.float32)
+    pair = [
+        ("layers.0.self_attn.q_b_proj.weight", weight),
+        ("layers.0.self_attn.q_b_proj.weight_scale_inv", scale),
+    ]
+    if scale_first:
+        pair.reverse()
+    monkeypatch.setattr(vllm_quant_utils, "load_dsv41_engram_rows", lambda weights, model: (weights, set()))
+    vllm_quant_utils.load_quanted_weights(pair, Runner(), peft_config={"r": 1})
+
+    assert [name for name, _ in Runner.model.loaded] == ["layers.0.self_attn.q_b_proj.weight"]
+    assert Runner.model.loaded[0][1].dtype == torch.bfloat16
+
+
+def test_unknown_weight_scale_is_preserved_for_fused_loader(monkeypatch):
+    """Keep a scale when the live fused owner cannot be resolved by name."""
+    from verl.utils.vllm import vllm_quant_utils
+
+    class Model:
+        def named_parameters(self, remove_duplicate=False):
+            return iter([("layers.0.mlp.experts.gate_up_proj.weight", torch.empty(2, 2, dtype=torch.float8_e4m3fn))])
+
+        def named_buffers(self):
+            return iter(())
+
+        def load_weights(self, weights):
+            self.loaded = list(weights)
+            return {name for name, _ in self.loaded}
+
+    class Runner:
+        model = Model()
+
+    weight = torch.ones((2, 2), dtype=torch.float8_e4m3fn)
+    scale = torch.full((1, 1), 7, dtype=torch.float32)
+    monkeypatch.setattr(vllm_quant_utils, "load_dsv41_engram_rows", lambda weights, model: (weights, set()))
+    vllm_quant_utils.load_quanted_weights(
+        [
+            ("layers.0.mlp.experts.0.gate_proj.weight", weight),
+            ("layers.0.mlp.experts.0.gate_proj.weight_scale_inv", scale),
+        ],
+        Runner(),
+        peft_config={"r": 1},
+    )
+
+    assert [name for name, _ in Runner.model.loaded] == [
+        "layers.0.mlp.experts.0.gate_proj.weight",
+        "layers.0.mlp.experts.0.gate_proj.weight_scale_inv",
+    ]
+
+
+def test_bf16_packed_projection_scale_is_dropped_for_fused_owner(monkeypatch):
+    """Shard scales follow the fused owner's BF16 dtype decision."""
+    from verl.utils.vllm import vllm_quant_utils
+
+    class Model:
+        packed_modules_mapping = {"in_proj_qkvbfg_a": ["q_proj", "k_proj", "v_proj"]}
+
+        def named_parameters(self, remove_duplicate=False):
+            return iter(
+                [
+                    (
+                        "language_model.model.layers.0.self_attn.in_proj_qkvbfg_a.base_layer.weight",
+                        torch.empty(2, 2, dtype=torch.bfloat16),
+                    )
+                ]
+            )
+
+        def named_buffers(self):
+            return iter(())
+
+        def load_weights(self, weights):
+            self.loaded = list(weights)
+            return {name for name, _ in self.loaded}
+
+    class Runner:
+        model = Model()
+
+    monkeypatch.setattr(vllm_quant_utils, "load_dsv41_engram_rows", lambda weights, model: (weights, set()))
+    vllm_quant_utils.load_quanted_weights(
+        [
+            ("layers.0.self_attn.q_proj.weight", torch.empty(2, 2, dtype=torch.bfloat16)),
+            ("layers.0.self_attn.q_proj.weight_scale_inv", torch.ones(1, 1)),
+        ],
+        Runner(),
+        peft_config={"r": 1},
+    )
+
+    assert [name for name, _ in Runner.model.loaded] == ["layers.0.self_attn.q_proj.weight"]
+
+
+def test_bf16_packed_projection_scale_uses_model_mapper(monkeypatch):
+    """The dtype probe must apply the outer multimodal and packed-name mapper."""
+    from verl.utils.vllm import vllm_quant_utils
+
+    class Mapper:
+        def apply_list(self, names):
+            return [
+                name.replace("model.language_model.", "language_model.model.").replace(".q_proj.", ".in_proj_qkvbfg_a.")
+                for name in names
+            ]
+
+    class Model:
+        hf_to_vllm_mapper = Mapper()
+        packed_modules_mapping = {"in_proj_qkvbfg_a": ["q_proj"]}
+
+        def named_parameters(self, remove_duplicate=False):
+            return iter(
+                [
+                    (
+                        "language_model.model.layers.0.self_attn.in_proj_qkvbfg_a.base_layer.weight",
+                        torch.empty(2, 2, dtype=torch.bfloat16),
+                    )
+                ]
+            )
+
+        def named_buffers(self):
+            return iter(())
+
+        def load_weights(self, weights):
+            self.loaded = list(weights)
+            return {name for name, _ in self.loaded}
+
+    class Runner:
+        model = Model()
+
+    monkeypatch.setattr(vllm_quant_utils, "load_dsv41_engram_rows", lambda weights, model: (weights, set()))
+    vllm_quant_utils.load_quanted_weights(
+        [
+            ("model.language_model.layers.0.self_attn.q_proj.weight", torch.empty(2, 2)),
+            ("model.language_model.layers.0.self_attn.q_proj.weight_scale_inv", torch.ones(1, 1)),
+        ],
+        Runner(),
+        peft_config={"r": 1},
+    )
+
+    assert [name for name, _ in Runner.model.loaded] == ["model.language_model.layers.0.self_attn.q_proj.weight"]
+
+
+def test_bf16_scale_uses_consistent_dtype_across_wrapper_aliases(monkeypatch):
+    """Duplicate LoRA/base aliases must not make a BF16 scale look unresolved."""
+    from verl.utils.vllm import vllm_quant_utils
+
+    class Model:
+        packed_modules_mapping = {"in_proj_qkvbfg_a": ["q_proj"]}
+
+        def named_parameters(self, remove_duplicate=False):
+            return iter(
+                [
+                    (
+                        "language_model.model.layers.0.self_attn.in_proj_qkvbfg_a.weight",
+                        torch.empty(2, 2, dtype=torch.bfloat16),
+                    ),
+                    (
+                        "language_model.model.layers.0.self_attn.in_proj_qkvbfg_a.base_layer.weight",
+                        torch.empty(2, 2, dtype=torch.bfloat16),
+                    ),
+                ]
+            )
+
+        def named_buffers(self):
+            return iter(())
+
+        def load_weights(self, weights):
+            self.loaded = list(weights)
+            return {name for name, _ in self.loaded}
+
+    class Runner:
+        model = Model()
+
+    monkeypatch.setattr(vllm_quant_utils, "load_dsv41_engram_rows", lambda weights, model: (weights, set()))
+    vllm_quant_utils.load_quanted_weights(
+        [
+            ("layers.0.self_attn.q_proj.weight", torch.empty(2, 2, dtype=torch.bfloat16)),
+            ("layers.0.self_attn.q_proj.weight_scale_inv", torch.ones(1, 1)),
+        ],
+        Runner(),
+        peft_config={"r": 1},
+    )
+
+    assert [name for name, _ in Runner.model.loaded] == ["layers.0.self_attn.q_proj.weight"]
 
 
 def test_flat_loader_strips_base_layer_suffix_on_newer_vllm(monkeypatch):
