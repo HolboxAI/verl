@@ -358,6 +358,13 @@ def load_quanted_weights(weights, model_runner, is_drafter=False, peft_config=No
                 ):
                     continue
             normalized_weights.append((resolved, tensor))
+        orphaned_weights = [
+            name
+            for name, entry in pending_fp8.items()
+            if "weight" in entry and "weight_scale" not in entry and "weight_scale_inv" not in entry
+        ]
+        if orphaned_weights:
+            raise RuntimeError("FP8 weights missing weight_scale or weight_scale_inv: " + ", ".join(orphaned_weights))
         weights = normalized_weights
     weights = list(weights)
 
