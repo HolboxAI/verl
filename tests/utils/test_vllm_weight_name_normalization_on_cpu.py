@@ -223,7 +223,8 @@ def _load_vllm_rollout_utils():
     return module
 
 
-def _load_vllm_quant_utils():
+@pytest.fixture(name="vllm_quant_utils")
+def _load_vllm_quant_utils(monkeypatch):
     """Load quantized refit helpers without importing the vLLM package.
 
     The CPU tests exercise only the pure Python name and dtype handling in
@@ -238,15 +239,15 @@ def _load_vllm_quant_utils():
     module_path = _REPO_ROOT / "verl/utils/vllm/vllm_quant_utils.py"
     fake_package = types.ModuleType(package_name)
     fake_package.__path__ = [str(module_path.parent)]
-    # Keep the namespace stub installed for the lifetime of this test module:
+    # Keep the namespace stub installed until this test's monkeypatch teardown:
     # ``load_quanted_weights`` imports ``resolve_weight_name`` lazily, and a
     # later import must not re-enter the real ``verl.utils.vllm.__init__``.
-    sys.modules[package_name] = fake_package
-    sys.modules[f"{package_name}.utils"] = _vllm_utils_real
+    monkeypatch.setitem(sys.modules, package_name, fake_package)
+    monkeypatch.setitem(sys.modules, f"{package_name}.utils", _vllm_utils_real)
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec is not None and spec.loader is not None
-    sys.modules[module_name] = module
+    monkeypatch.setitem(sys.modules, module_name, module)
     spec.loader.exec_module(module)
     return module
 
@@ -259,7 +260,6 @@ vLLMColocateWorkerExtension = _vllm_rollout_utils.vLLMColocateWorkerExtension
 # the vLLM-version branch under test.
 _vllm_utils_real = _vllm_rollout_utils._vllm_utils_real
 resolve_weight_name = _vllm_utils_real.resolve_weight_name
-_vllm_quant_utils = _load_vllm_quant_utils()
 
 
 def _use_new_vllm_loader_contract(monkeypatch):
@@ -1330,9 +1330,8 @@ def test_strict_loader_re_suffixes_plain_name_on_newer_vllm(monkeypatch):
     assert _resolve(worker, model, plain) == live  # re-suffixed
 
 
-def test_bf16_projection_scales_are_dropped_without_live_scale(monkeypatch):
+def test_bf16_projection_scales_are_dropped_without_live_scale(monkeypatch, vllm_quant_utils):
     """Trainer-only scales for live BF16 projections must be ignored."""
-    vllm_quant_utils = _vllm_quant_utils
     _use_new_vllm_loader_contract(monkeypatch)
 
     class Mapper:
@@ -1386,9 +1385,8 @@ def test_bf16_projection_scales_are_dropped_without_live_scale(monkeypatch):
 
 
 @pytest.mark.parametrize("scale_first", [False, True])
-def test_fp8_pair_keeps_weight_name_when_dequantized(monkeypatch, scale_first):
+def test_fp8_pair_keeps_weight_name_when_dequantized(monkeypatch, vllm_quant_utils, scale_first):
     """A paired FP8 weight must be loaded under its weight name, in either order."""
-    vllm_quant_utils = _vllm_quant_utils
     _use_new_vllm_loader_contract(monkeypatch)
 
     class Model:
@@ -1419,9 +1417,8 @@ def test_fp8_pair_keeps_weight_name_when_dequantized(monkeypatch, scale_first):
     assert Runner.model.loaded[0][1].dtype == torch.bfloat16
 
 
-def test_unknown_weight_scale_is_preserved_for_fused_loader(monkeypatch):
+def test_unknown_weight_scale_is_preserved_for_fused_loader(monkeypatch, vllm_quant_utils):
     """Keep a scale when the live fused owner cannot be resolved by name."""
-    vllm_quant_utils = _vllm_quant_utils
     _use_new_vllm_loader_contract(monkeypatch)
 
     class Model:
@@ -1455,9 +1452,8 @@ def test_unknown_weight_scale_is_preserved_for_fused_loader(monkeypatch):
     ]
 
 
-def test_bf16_packed_projection_scale_is_dropped_for_fused_owner(monkeypatch):
+def test_bf16_packed_projection_scale_is_dropped_for_fused_owner(monkeypatch, vllm_quant_utils):
     """Shard scales follow the fused owner's BF16 dtype decision."""
-    vllm_quant_utils = _vllm_quant_utils
     _use_new_vllm_loader_contract(monkeypatch)
 
     class Model:
@@ -1495,9 +1491,8 @@ def test_bf16_packed_projection_scale_is_dropped_for_fused_owner(monkeypatch):
     assert [name for name, _ in Runner.model.loaded] == ["layers.0.self_attn.q_proj.weight"]
 
 
-def test_bf16_packed_projection_scale_uses_model_mapper(monkeypatch):
+def test_bf16_packed_projection_scale_uses_model_mapper(monkeypatch, vllm_quant_utils):
     """The dtype probe must apply the outer multimodal and packed-name mapper."""
-    vllm_quant_utils = _vllm_quant_utils
     _use_new_vllm_loader_contract(monkeypatch)
 
     class Mapper:
@@ -1543,9 +1538,8 @@ def test_bf16_packed_projection_scale_uses_model_mapper(monkeypatch):
     assert [name for name, _ in Runner.model.loaded] == ["model.language_model.layers.0.self_attn.q_proj.weight"]
 
 
-def test_bf16_scale_uses_consistent_dtype_across_wrapper_aliases(monkeypatch):
+def test_bf16_scale_uses_consistent_dtype_across_wrapper_aliases(monkeypatch, vllm_quant_utils):
     """Duplicate LoRA/base aliases must not make a BF16 scale look unresolved."""
-    vllm_quant_utils = _vllm_quant_utils
     _use_new_vllm_loader_contract(monkeypatch)
 
     class Model:
