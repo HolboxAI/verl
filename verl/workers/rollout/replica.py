@@ -380,10 +380,17 @@ def _load_trtllm():
     return TRTLLMReplica
 
 
+def _load_hf():
+    from verl.workers.rollout.hf_rollout.hf_async_server import HFReplica
+
+    return HFReplica
+
+
 # Register built-in types
 RolloutReplicaRegistry.register("vllm", _load_vllm)
 RolloutReplicaRegistry.register("sglang", _load_sglang)
 RolloutReplicaRegistry.register("trtllm", _load_trtllm)
+RolloutReplicaRegistry.register("hf", _load_hf)
 
 
 def get_rollout_replica_class(rollout: str, disaggregation_enabled: bool = False) -> type[RolloutReplica]:
