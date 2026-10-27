@@ -33,7 +33,7 @@ from verl.utils.torch_functional import get_response_mask
 
 from .base import BaseRollout
 
-__all__ = ["HFRollout"]
+__all__ = ["HFRollout", "ServerAdapter"]
 
 
 class HFRollout(BaseRollout):
@@ -175,3 +175,120 @@ class HFRollout(BaseRollout):
 
         self.module.train()
         return DataProto(batch=batch)
+
+
+class ServerAdapter(BaseRollout):
+    """HF rollout adapter for verl's async rollout mode.
+
+    vLLM/SGLang/TRT-LLM front a separate inference server, so their async
+    ``ServerAdapter`` classes are clients that talk to that server. The HF
+    rollout instead runs ``transformers`` generation in-process, so this
+    adapter holds the (single-device) model and implements the weight-sync
+    contract the async trainer calls (``resume`` / ``update_weights`` /
+    ``release``) by loading the named tensors straight into the held model.
+
+    This resolves ``Rollout hf with mode async not found`` on the weight-sync
+    side. Generating in async mode still requires an HF server behind the
+    LLM-server client (see ``verl/workers/rollout/llm_server.py``); this
+    adapter covers the weight-sync contract.
+    """
+
+    def __init__(self, config, model_config, device_mesh, *args, **kwargs):
+        super().__init__(config, model_config, device_mesh)
+        self.device_name = get_device_name()
+        self.device = torch.device(self.device_name) if self.device_name != "cpu" else torch.device("cpu")
+        self.module, self.tokenizer, self.processor = self._load_model()
+        self.module.eval()
+
+    def _load_model(self):
+        """Load a single-device HF model (+ LoRA) for in-process generation."""
+        from transformers import (
+            AutoConfig,
+            AutoModelForCausalLM,
+            AutoModelForImageTextToText,
+            AutoProcessor,
+            AutoTokenizer,
+        )
+
+        cfg = AutoConfig.from_pretrained(
+            self.model_config.local_path, trust_remote_code=self.model_config.trust_remote_code
+        )
+        is_vlm = getattr(cfg, "vision_config", None) is not None
+        auto_cls = AutoModelForImageTextToText if is_vlm else AutoModelForCausalLM
+        model = auto_cls.from_pretrained(
+            self.model_config.local_path,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=self.model_config.trust_remote_code,
+        )
+
+        if getattr(self.model_config, "lora_rank", 0) > 0:
+            from peft import LoraConfig, TaskType, get_peft_model
+
+            lora_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=self.model_config.lora_rank,
+                lora_alpha=self.model_config.lora_alpha,
+                target_modules=self.model_config.target_modules,
+                exclude_modules=self.model_config.exclude_modules,
+                bias="none",
+            )
+            model = get_peft_model(model, lora_config)
+
+        model = model.to(self.device)
+        tokenizer = AutoTokenizer.from_pretrained(
+            self.model_config.local_path, trust_remote_code=self.model_config.trust_remote_code
+        )
+        processor = (
+            AutoProcessor.from_pretrained(
+                self.model_config.local_path, trust_remote_code=self.model_config.trust_remote_code
+            )
+            if is_vlm
+            else None
+        )
+        return model, tokenizer, processor
+
+    async def resume(self, tags: list[str]):
+        # In-process model: nothing to wake. Keep the cache warm.
+        return
+
+    async def release(self):
+        # In-process model: drop the cache so the next stage can reuse device memory.
+        try:
+            get_torch_device().empty_cache()
+        except Exception:
+            pass
+
+    async def update_weights(
+        self,
+        weights,
+        global_steps=None,
+        wire_format="named_tensors",
+        **kwargs,
+    ):
+        """Load the trainer's named tensors into the held model."""
+        assert wire_format == "named_tensors", (
+            f"HF rollout supports wire_format='named_tensors'; got {wire_format!r}"
+        )
+        state_dict = {}
+        for name, tensor in weights:
+            state_dict[name] = tensor.to(self.device, dtype=self.module.dtype)
+
+        missing, _ = self.module.load_state_dict(state_dict, strict=False)
+        # The actor may emit "model.<name>" depending on how it wraps the module.
+        if missing:
+            stripped = {
+                (k[len("model.") :] if k.startswith("model.") else k): v for k, v in state_dict.items()
+            }
+            self.module.load_state_dict(stripped, strict=False)
+
+    def generate_sequences(self, prompts: DataProto) -> DataProto:
+        """Synchronous generation is handled by ``HFRollout``, not this adapter.
+
+        In async mode, generation goes through the LLM-server client
+        (``verl/workers/rollout/llm_server.py``) talking to an HF server; this
+        adapter only implements the weight-sync contract.
+        """
+        raise NotImplementedError(
+            "HFRollout ServerAdapter does not support synchronous generate_sequences. "
+            "Use HFRollout for sync generation, or the async server interface for async generation."
+        )
