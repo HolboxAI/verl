@@ -260,9 +260,22 @@ class HFReplica(RolloutReplica):
         node_id = worker_infos[0]
         prefix = self._get_server_name_prefix()
         name = f"{prefix}server_{self.replica_rank}_0{self.name_suffix}"
+        # The rollout server is its own one-process TorchTPU group: give it the
+        # first chip after the actor's (n_gpus_per_node) and a disjoint slice-builder
+        # port range so it does not collide with the actor's process group.
+        rollout_chip = self.config.n_gpus_per_node
         env_vars = {
             **{var: "1" for var in get_platform().ray_noset_envvars()},
             **get_platform().rollout_env_vars(),
+            "TORCH_TPU_TOPOLOGY": "1,1,1",
+            "TORCH_TPU_SLICEBUILDER_ADDRESSES": "localhost:9570",
+            "TPU_VISIBLE_DEVICES": str(rollout_chip),
+            "TPU_VISIBLE_CHIPS": str(rollout_chip),
+            "TPU_CHIPS_PER_PROCESS_BOUNDS": "1,1,1",
+            "TPU_PROCESS_BOUNDS": "1,1,1",
+            "TPU_PROCESS_ADDRESSES": "localhost:9578",
+            "TPU_PROCESS_PORT": "9578",
+            "CLOUD_TPU_TASK_ID": "0",
         }
 
         server = self.server_class.options(
