@@ -34,7 +34,9 @@ import ray
 import torch
 
 from verl.plugin.platform import get_platform
+from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_device_name, get_torch_device
+from verl.workers.config.model import HFModelConfig
 from verl.workers.rollout.replica import RolloutReplica, TokenOutput
 
 logger = logging.getLogger(__file__)
@@ -63,7 +65,7 @@ class HFHttpServer:
         cuda_visible_devices: Optional[str] = None,
     ):
         self.config = config
-        self.model_config = model_config
+        self.model_config = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
         self.rollout_mode = rollout_mode
         self.replica_rank = replica_rank
         self.node_rank = node_rank
